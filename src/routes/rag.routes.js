@@ -208,13 +208,19 @@ ragRouter.post("/query", async (c) => {
 
   if (body.stream && result.stream) {
     return streamSSE(c, async (stream) => {
-      // Send context and metadata early so the UI can construct the citations
+      // Send sources and metadata early so the UI can construct citations.
+      const metadataEvent = {
+        fragmentosUsados: result.fragmentosUsados,
+        metadata: result.metadata,
+      };
+
+      if (Array.isArray(result.context)) {
+        metadataEvent.context = result.context;
+      }
+
       await stream.writeSSE({
         event: "metadata",
-        data: JSON.stringify({
-          context: result.context,
-          metadata: result.metadata,
-        }),
+        data: JSON.stringify(metadataEvent),
       });
 
       // Send the text chunks

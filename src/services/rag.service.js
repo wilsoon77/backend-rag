@@ -18,6 +18,38 @@ const vectorColumnType = env.embeddingDimensions > 2000 ? "halfvec" : "vector";
 const vectorIndexOperatorClass =
   vectorColumnType === "halfvec" ? "halfvec_cosine_ops" : "vector_cosine_ops";
 const vectorIndexMethod = vectorColumnType === "halfvec" ? "hnsw" : "ivfflat";
+const SOURCE_TYPE_DOCUMENT = "documento";
+const SOURCE_TYPE_DATABASE = "base_datos";
+
+function normalizeSourceType(value, fallback = SOURCE_TYPE_DOCUMENT) {
+  if (typeof value !== "string") {
+    return fallback;
+  }
+
+  const normalized = value.trim().toLowerCase().replace(/\s+/g, "_");
+
+  if (normalized === "base_de_datos" || normalized === "database" || normalized === "db") {
+    return SOURCE_TYPE_DATABASE;
+  }
+
+  if (normalized === "document") {
+    return SOURCE_TYPE_DOCUMENT;
+  }
+
+  if (normalized === SOURCE_TYPE_DOCUMENT || normalized === SOURCE_TYPE_DATABASE) {
+    return normalized;
+  }
+
+  return fallback;
+}
+
+function normalizeIdentifierValue(value, fallback) {
+  if (typeof value === "string" && value.trim()) {
+    return value.trim();
+  }
+
+  return fallback;
+}
 
 function parseMetadataRow(value) {
   if (isPlainObject(value)) {
@@ -92,14 +124,16 @@ function buildDefaultDocumentIdentifier(fuente, contenido, metadata = {}) {
 
 function enrichDocumentMetadata(metadata, fuente, contenido) {
   const normalized = normalizeMetadata(metadata);
-  const tipoFuenteRaw = typeof normalized.tipoFuente === "string" ? normalized.tipoFuente.trim() : "";
-  const identificadorRaw =
-    typeof normalized.identificador === "string" ? normalized.identificador.trim() : "";
+  const tipoFuente = normalizeSourceType(normalized.tipoFuente, SOURCE_TYPE_DOCUMENT);
+  const identificador = normalizeIdentifierValue(
+    normalized.identificador,
+    buildDefaultDocumentIdentifier(fuente, contenido, normalized)
+  );
 
   return {
     ...normalized,
-    tipoFuente: tipoFuenteRaw || "documento",
-    identificador: identificadorRaw || buildDefaultDocumentIdentifier(fuente, contenido, normalized),
+    tipoFuente,
+    identificador,
   };
 }
 
@@ -110,15 +144,8 @@ function parseNumericScore(value, fallback = 0) {
 
 function buildDocumentContextItem(row, fallbackScore = 0) {
   const metadata = parseMetadataRow(row.metadata);
-  const tipoFuente =
-    typeof metadata.tipoFuente === "string" && metadata.tipoFuente.trim()
-      ? metadata.tipoFuente.trim()
-      : "documento";
-
-  const identificador =
-    typeof metadata.identificador === "string" && metadata.identificador.trim()
-      ? metadata.identificador.trim()
-      : `doc:${row.id}`;
+  const tipoFuente = normalizeSourceType(metadata.tipoFuente, SOURCE_TYPE_DOCUMENT);
+  const identificador = normalizeIdentifierValue(metadata.identificador, `doc:${row.id ?? "sin-id"}`);
 
   return {
     id: row.id,
@@ -134,14 +161,15 @@ function buildDocumentContextItem(row, fallbackScore = 0) {
 function buildRecordContextItem(row, safeTableName) {
   const metadata = parseMetadataRow(row.metadata);
   const recordId = row.id ?? "sin-id";
+  const identificador = normalizeIdentifierValue(metadata.identificador, `${safeTableName}:${recordId}`);
 
   return {
     id: recordId,
     fuente: row.fuente || env.ragRecordsSourceLabel || safeTableName,
     contenido: row.contenido,
     metadata,
-    tipoFuente: "base_datos",
-    identificador: `${safeTableName}:${recordId}`,
+    tipoFuente: SOURCE_TYPE_DATABASE,
+    identificador,
     score: parseNumericScore(row.score),
   };
 }
@@ -153,6 +181,199 @@ function buildPromptContext(contextItems = []) {
         `Contexto ${index + 1} [${item.tipoFuente}] (${item.fuente} | ${item.identificador}):\n${item.contenido}`
     )
     .join("\n\n");
+}
+
+function normalizeAnswerText(value) {
+  return String(value || "")
+    .replace(/\r/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function stripListPrefix(line) {
+  return line.trim().replace(/^([*-]\s+|\d+\.\s+)/, "");
+}
+
+function isInternalAnswerLine(line) {
+  const normalized = stripListPrefix(line).toLowerCase();
+
+  if (!normalized) {
+    return false;
+  }
+
+  return [
+    /^question:/i,
+    /^pregunta:/i,
+    /^constraint\s*\d+:/i,
+    /^restriccion\s*\d+:/i,
+    /^context\s*\d+:/i,
+    /^contexto\s*\d+:/i,
+    /^draft:/i,
+    /^borrador:/i,
+    /^only based on context\?/i,
+    /^insufficient evidence\?/i,
+    /^cite sources\?/i,
+    /^cites sources\?/i,
+    /^only final answer\?/i,
+    /^no internal blocks\?/i,
+    /^spanish\?/i,
+    /^solo con base en el contexto\?/i,
+    /^evidencia insuficiente\?/i,
+    /^cita fuentes\?/i,
+    /^solo respuesta final\?/i,
+    /^sin bloques internos\?/i,
+    /^espanol\?/i,
+  ].some((pattern) => pattern.test(normalized));
+}
+
+function removeChecklistFragments(text) {
+  return String(text || "")
+    .replace(
+      /\b(?:cite sources\?|cites sources\?|only final answer\?|no internal blocks\?|only based on context\?|insufficient evidence\?|spanish\?)\s*yes\.?/gi,
+      ""
+    )
+    .replace(
+      /\b(?:cita fuentes\?|solo respuesta final\?|sin bloques internos\?|solo con base en el contexto\?|evidencia insuficiente\?|espanol\?)\s*s[ií]\.?/gi,
+      ""
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function pickQuotedAnswerCandidate(text) {
+  const raw = String(text || "");
+  const matches = [...raw.matchAll(/"([^"\n]{40,})"/g)].map((item) => item[1].trim());
+
+  if (!matches.length) {
+    return "";
+  }
+
+  const candidates = matches.filter(
+    (chunk) => !/(question:|pregunta:|constraint\s*\d+:|context\s*\d+:|contexto\s*\d+:|draft:|borrador:)/i.test(chunk)
+  );
+
+  if (!candidates.length) {
+    return "";
+  }
+
+  const score = (chunk) => {
+    let points = 0;
+
+    if (/\b(el|la|los|las|de|del|para|con|se|que|y|en)\b/i.test(chunk)) {
+      points += 2;
+    }
+
+    if (/[áéíóúñ]/i.test(chunk)) {
+      points += 1;
+    }
+
+    if (/\|\s*doc:\w+/i.test(chunk) || /\(.*\|\s*doc:/i.test(chunk)) {
+      points += 1;
+    }
+
+    return points;
+  };
+
+  return candidates
+    .sort((a, b) => {
+      const byScore = score(b) - score(a);
+      if (byScore !== 0) return byScore;
+      return b.length - a.length;
+    })
+    .at(0);
+}
+
+function dedupeSentences(text) {
+  const normalized = text
+    .replace(/\)\s*([A-Za-z])/g, ") $1")
+    .replace(/([a-z0-9áéíóúñ][.!?])([A-ZÁÉÍÓÚÑ])/g, "$1 $2")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) {
+    return "";
+  }
+
+  const chunks = normalized.split(/(?<=[.!?])\s+/);
+  const unique = [];
+  const seen = new Set();
+
+  for (const chunk of chunks) {
+    const sentence = chunk.trim();
+
+    if (!sentence) {
+      continue;
+    }
+
+    const key = sentence.toLowerCase().replace(/\s+/g, " ").trim();
+
+    if (seen.has(key) && key.length > 20) {
+      continue;
+    }
+
+    seen.add(key);
+    unique.push(sentence);
+  }
+
+  return unique.join(" ").trim();
+}
+
+function sanitizeModelAnswer(value) {
+  const raw = normalizeAnswerText(value);
+
+  if (!raw) {
+    return "";
+  }
+
+  const filteredLines = raw.split("\n").filter((line) => !isInternalAnswerLine(line));
+  let cleaned = normalizeAnswerText(filteredLines.join("\n"));
+
+  if (!cleaned) {
+    return raw;
+  }
+
+  const allListLines = cleaned
+    .split("\n")
+    .every((line) => !line.trim() || /^([*-]\s+|\d+\.\s+)/.test(line.trim()));
+
+  if (allListLines) {
+    cleaned = normalizeAnswerText(
+      cleaned
+        .split("\n")
+        .map((line) => stripListPrefix(line))
+        .join(" ")
+    );
+  }
+
+  const hasInternalScaffold =
+    /(?:question:|pregunta:|constraint\s*\d+:|context\s*\d+:|contexto\s*\d+:|draft:|borrador:|only based on context\?|insufficient evidence\?|cite sources\?|cites sources\?|only final answer\?|no internal blocks\?|spanish\?|solo con base en el contexto\?|evidencia insuficiente\?|cita fuentes\?|solo respuesta final\?|sin bloques internos\?|espanol\?)/i.test(
+      raw
+    );
+
+  cleaned = removeChecklistFragments(cleaned);
+
+  if (hasInternalScaffold) {
+    const quotedCandidate = pickQuotedAnswerCandidate(cleaned || raw);
+
+    if (quotedCandidate) {
+      cleaned = quotedCandidate;
+    }
+  }
+
+  if (hasInternalScaffold) {
+    const paragraphs = cleaned
+      .split(/\n{2,}/)
+      .map((paragraph) => paragraph.trim())
+      .filter(Boolean);
+
+    if (paragraphs.length > 1) {
+      cleaned = paragraphs[paragraphs.length - 1];
+    }
+  }
+
+  cleaned = dedupeSentences(cleaned);
+  return cleaned || raw;
 }
 
 async function ensureDocumentosRagSchema() {
@@ -713,6 +934,8 @@ export async function queryRag(payload) {
       "Responde únicamente con base en el contexto recuperado.",
       'Si no hay evidencia suficiente, responde: "No tengo evidencia suficiente en los documentos recuperados."',
       "Cita las fuentes utilizadas.",
+      "Entrega solo la respuesta final para el usuario.",
+      "No incluyas bloques internos como Question, Constraint, Context, Draft ni autoevaluaciones.",
       "Responde en español.",
     ].join("\n");
 
@@ -726,6 +949,9 @@ export async function queryRag(payload) {
     let provider = "";
     let streamGenerator = null;
     const isStreaming = parseBoolean(payload?.stream);
+    const includeContext = parseBoolean(
+      payload?.includeContext ?? payload?.incluirContexto ?? payload?.debug ?? payload?.modoDebug
+    );
 
     if (isStreaming) {
       if (requestedProvider === "groq") {
@@ -767,6 +993,10 @@ export async function queryRag(payload) {
       }
     }
 
+    if (!isStreaming) {
+      answer = sanitizeModelAnswer(answer);
+    }
+
     const latencyMs = Date.now() - startTime;
 
     const fragmentos = mergedContext.map(({ id, fuente, contenido, metadata, score, tipoFuente, identificador }) => ({
@@ -782,7 +1012,6 @@ export async function queryRag(payload) {
     const responseObj = {
       ok: true,
       answer,
-      context: fragmentos,
       fragmentosUsados: fragmentos,
       metadata: {
         embeddingModel: env.embeddingModel,
@@ -811,6 +1040,10 @@ export async function queryRag(payload) {
         },
       },
     };
+
+    if (includeContext) {
+      responseObj.context = fragmentos;
+    }
 
     if (isStreaming && streamGenerator) {
       responseObj.stream = streamGenerator;
